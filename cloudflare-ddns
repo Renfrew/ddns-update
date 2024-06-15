@@ -1,0 +1,130 @@
+#!/bin/bash
+#
+# This is a Bash script to update a Cloudflare A record with the current external IP.
+# The example below would update the local.example.com A record to the current external IP with a TTL of 5 minutes.
+#
+# Dependencies: jq, dig, curl
+#
+# The script will log to /var/log/me.renfrew.dnsUpdate.log and /var/log/me.renfrew.dnsUpdate.err
+#
+# Usage:
+# cloudflare-ddns.sh <ACCESS_TOKEN> <DOMAIN> <SUBDOMAIN> <TTL>
+#
+# Example:
+# cloudflare-ddns.sh aCcEFfdsOKeN example.com local 300
+#
+
+API="https://api.cloudflare.com/client/v4"
+LOG_FILE=/var/log/me.renfrew.dnsUpdate
+LOG_DIR=$(dirname $LOG_FILE)
+
+if [[ ! -e "$LOG_FILE.log" && ! -e "$LOG_FILE.err" && -w "$LOG_DIR" ]]; then
+    touch $LOG_FILE.log
+    touch $LOG_FILE.err
+fi
+
+if [[ -w "$LOG_FILE.log" && -w "$LOG_FILE.err" ]]; then
+  exec 2> >(tee -a $LOG_FILE.err $LOG_FILE.log)
+fi
+
+logger_own() {
+  # Print to console
+  echo $2
+
+  # Log to log file
+  if [[ -w "$LOG_FILE.log" ]]; then
+    echo $(date '+%Y-%m-%d %H:%M:%S') [$1] $2 >> $LOG_FILE.log
+  fi
+}
+
+if [ "$#" -ne 4 ]; then
+  echo "Wrong number of parameters passed"
+  echo "Usage:"
+  echo "$0 <ACCESS_TOKEN> <DOMAIN> <SUBDOMAIN> <TTL>"
+  exit
+fi
+
+ACCESS_TOKEN="$1"
+DOMAIN="$2"
+SUBDOMAIN="$3"
+TTL="$4"
+
+IP_PATTERN='^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
+
+EXTERNAL_IP=$(dig +short myip.opendns.com @resolver1.opendns.com)
+if [[ ! $EXTERNAL_IP =~ $IP_PATTERN ]]; then
+  logger_own ERROR "There was a problem resolving the external IP, response was \"$EXTERNAL_IP\""
+  exit
+fi
+logger_own DEBUG  "Current external IP is $EXTERNAL_IP"
+
+HOSTNAME="$SUBDOMAIN.$DOMAIN"
+CURRENT_IP=$(
+  curl --silent -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=$HOSTNAME&type=A" |
+  jq -c '.Answer[]? | select(.type == 1) | .data' --raw-output
+)
+logger_own DEBUG "Current $HOSTNAME DNS record is \"$CURRENT_IP\""
+
+if [[ "$CURRENT_IP" != "$EXTERNAL_IP" ]]; then
+  DNS_ZONES_RESPONSE=$(curl -s "$API/zones?status=active" --header "Authorization: Bearer $ACCESS_TOKEN" --header "Content-Type:application/json")
+  if [[ $(echo $DNS_ZONES_RESPONSE | jq ".success" --raw-output) != "true" ]]; then
+    logger_own ERROR "There was a problem fetching the DNS zones, response code was $(echo $DNS_ZONES_RESPONSE | jq '.errors[0] | .code' --raw-output)"
+    exit
+  fi
+
+  ZONE_ID=$(echo $DNS_ZONES_RESPONSE | jq ".result[]  | select(.name == \"$DOMAIN\") | .id" --raw-output)
+  DNS_RECORDS_RESPONSE=$(curl -s "$API/zones/$ZONE_ID/dns_records" --header "Authorization: Bearer $ACCESS_TOKEN" --header "Content-Type:application/json")
+  if [[ $(echo $DNS_RECORDS_RESPONSE | jq ".success" --raw-output) != "true" ]]; then
+    logger_own ERROR "There was a problem fetching the DNS records, response code was $(echo $DNS_RECORDS_RESPONSE | jq '.errors[0] | .code' --raw-output)"
+    exit
+  fi
+
+  RECORD=$(echo $DNS_RECORDS_RESPONSE | jq ".result[]  | select(.name == \"$HOSTNAME\")" --raw-output)
+  BODY=$(jq -n --arg hostname "$HOSTNAME" --arg externalIp "$EXTERNAL_IP" --arg ttl $TTL '
+  {
+    "type": "A",
+    "name": $hostname,
+    "content": $externalIp,
+    "ttl": $ttl|tonumber
+  }')
+
+  if [[ -n "${RECORD:-}" ]]; then
+    RECORD_ID=$(echo $RECORD | jq ".id" --raw-output)
+    logger_own INFO "Updating record $RECORD_ID for $HOSTNAME with value $EXTERNAL_IP"
+
+    RESPONSE=$(curl -X PUT -s --data "$BODY" "$API/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+      --header "Authorization: Bearer $ACCESS_TOKEN" \
+      --header "Content-Type:application/json"
+    )
+
+    if [[ $(echo $RESPONSE | jq ".success" --raw-output) != "true" ]]; then
+      logger_own ERROR "There was a problem updating $HOSTNAME entry, response code was $(echo $RESPONSE | jq '.errors[0] | .code' --raw-output)"
+      exit
+    fi
+
+  else
+    logger_own INFO "Creating new entry for $HOSTNAME with value $EXTERNAL_IP"
+
+    RESPONSE=$(curl -X POST -s --data "$BODY" "$API/zones/$ZONE_ID/dns_records" \
+      --header "Authorization: Bearer $ACCESS_TOKEN" \
+      --header "Content-Type:application/json"
+    )
+
+    if [[ $(echo $RESPONSE | jq ".success" --raw-output) != "true" ]]; then
+      logger_own ERROR "There was a problem creating $HOSTNAME entry, response code was $(echo $RESPONSE | jq '.errors[0] | .code' --raw-output)"
+      exit
+    fi
+  fi
+
+  NEW_RECORD_TYPE=$(echo $RESPONSE | jq ".result | .type" --raw-output)
+  NEW_RECORD_HOSTNAME=$(echo $RESPONSE | jq ".result | .name" --raw-output)
+  NEW_RECORD_VALUE=$(echo $RESPONSE | jq ".result | .content" --raw-output)
+  NEW_RECORD_TTL=$(echo $RESPONSE | jq ".result | .ttl" --raw-output)
+
+  if [[ $NEW_RECORD_TYPE != "A" ]] || [[ $NEW_RECORD_HOSTNAME != $HOSTNAME ]] || [[ $NEW_RECORD_VALUE != $EXTERNAL_IP ]] || [[ $NEW_RECORD_TTL != $TTL ]]; then
+    logger_own ERROR "There was a problem creating the new entry, some values did not match"
+    exit
+  fi
+
+  logger_own INFO "Successfully updated $HOSTNAME to $EXTERNAL_IP with a TTL of $TTL"
+fi

@@ -1,0 +1,131 @@
+#!/bin/bash
+#
+# This is a Bash script to update a Netlify A record with the current external IP.
+# The example below would update the local.example.com A record to the current external IP with a TTL of 5 minutes.
+#
+# Dependencies: jq, dig, curl
+#
+# Usage:
+# netlify-ddns.sh <ACCESS_TOKEN> <DOMAIN> <SUBDOMAIN> <TTL>
+#
+# Example:
+# netlify-ddns.sh aCcEsStOKeN example.com local 300
+#
+# Credits to
+# Repo: https://github.com/skylerwlewis/netlify-ddns
+# Gist: https://gist.github.com/skylerwlewis/ba052db5fe26424255674931d43fc030
+#
+
+API="https://api.netlify.com/api/v1"
+LOG_FILE=/var/log/me.renfrew.dnsUpdate
+LOG_DIR=$(dirname $LOG_FILE)
+
+if [[ ! -e "$LOG_FILE.log" && ! -e "$LOG_FILE.err" && -w "$LOG_DIR" ]]; then
+    touch $LOG_FILE.log
+    touch $LOG_FILE.err
+fi
+
+if [[ -w "$LOG_FILE.log" && -w "$LOG_FILE.err" ]]; then
+  exec 2> >(tee -a $LOG_FILE.err $LOG_FILE.log)
+fi
+
+logger_own() {
+  # Print to console
+  echo $2
+
+  # Log to log file
+  if [[ -w "$LOG_FILE.log" ]]; then
+    echo $(date '+%Y-%m-%d %H:%M:%S') [$1] $2 >> $LOG_FILE.log
+  fi
+}
+
+if [ "$#" -ne 4 ]; then
+  echo "Wrong number of parameters passed"
+  echo "Usage:"
+  echo "$0 <ACCESS_TOKEN> <DOMAIN> <SUBDOMAIN> <TTL>"
+  exit
+fi
+
+ACCESS_TOKEN="$1"
+DOMAIN="$2"
+SUBDOMAIN="$3"
+TTL="$4"
+
+IP_PATTERN='^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
+
+EXTERNAL_IP=$(dig +short myip.opendns.com @resolver1.opendns.com)
+if [[ ! $EXTERNAL_IP =~ $IP_PATTERN ]]; then
+  logger_own ERROR "There was a problem resolving the external IP, response was \"$EXTERNAL_IP\""
+  exit
+fi
+logger_own DEBUG  "Current external IP is $EXTERNAL_IP"
+
+HOSTNAME="$SUBDOMAIN.$DOMAIN"
+CURRENT_IP=$(
+  curl --silent -H 'accept: application/dns-json' "https://cloudflare-dns.com/dns-query?name=$HOSTNAME&type=A" |
+  jq -c '.Answer[]? | select(.type == 1) | .data' --raw-output
+)
+logger_own DEBUG "Current $HOSTNAME DNS record is \"$CURRENT_IP\""
+
+if [[ "$CURRENT_IP" != "$EXTERNAL_IP" ]]; then
+  DNS_ZONES_RESPONSE=$(curl -s "$NETLIFY_API/dns_zones?access_token=$ACCESS_TOKEN" --header "Content-Type:application/json")
+  if [[ -n "$(echo $DNS_ZONES_RESPONSE | jq '.code?' --raw-output)" ]]; then
+    logger_own ERROR "There was a problem fetching the DNS zones, response code was $(echo $DNS_ZONES_RESPONSE | jq '.code' --raw-output)"
+    exit
+  fi
+
+  ZONE_ID=$(echo $DNS_ZONES_RESPONSE | jq ".[]?  | select(.name == \"$DOMAIN\") | .id" --raw-output)
+  DNS_RECORDS_RESPONSE=$(curl -s "$API/dns_zones/$ZONE_ID/dns_records?access_token=$ACCESS_TOKEN" --header "Content-Type:application/json")
+  if [[ -n "$(echo $DNS_RECORDS_RESPONSE | jq '.code?' --raw-output)" ]]; then
+    logger_own ERROR "There was a problem fetching the DNS records, response code was $(echo $DNS_RECORDS_RESPONSE | jq '.code' --raw-output)"
+    exit
+  fi
+
+  RECORD=$(echo $DNS_RECORDS_RESPONSE | jq ".[]?  | select(.hostname == \"$HOSTNAME\")" --raw-output)
+  BODY=$(jq -n --arg hostname "$HOSTNAME" --arg externalIp "$EXTERNAL_IP" --arg ttl $TTL '
+  {
+      "type": "A",
+      "hostname": $hostname,
+      "value": $externalIp,
+      "ttl": $ttl|tonumber
+  }')
+
+  if [[ -n "${RECORD:-}" ]]; then
+    RECORD_ID=`echo $RECORD | jq ".id" --raw-output`
+    logger_own INFO "Updating record $RECORD_ID for $HOSTNAME with value $EXTERNAL_IP"
+
+    RESPONSE_CODE=$(curl -X DELETE -s -w "%{response_code}" \
+      "$NETLIFY_API/dns_zones/$ZONE_ID/dns_records/$RECORD_ID?access_token=$ACCESS_TOKEN" \
+      --header "Content-Type:application/json"
+    )
+
+    if [[ RESPONSE_CODE != 204 ]]; then
+      logger_own ERROR "There was a problem deleting the existing $HOSTNAME entry, response code was $RESPONSE_CODE"
+      exit
+    fi
+  fi
+
+  logger_own INFO "Creating new entry for $HOSTNAME with value $EXTERNAL_IP"
+
+  RESPONSE=$(curl -s --data "$BODY" "$API/dns_zones/$ZONE_ID/dns_records?access_token=$ACCESS_TOKEN" \
+    --header "Content-Type:application/json"
+  )
+
+  if [[ -n "$(echo $RESPONSE | jq ".code?" --raw-output)" ]]; then
+    logger_own ERROR "There was a problem creating $HOSTNAME entry, response code was $(echo $RESPONSE | jq '.code' --raw-output)"
+    exit
+  fi
+
+  NEW_RECORD_TYPE=$(echo $CREATE_RESPONSE | jq ".type" --raw-output)
+  NEW_RECORD_HOSTNAME=$(echo $CREATE_RESPONSE | jq ".hostname" --raw-output)
+  NEW_RECORD_VALUE=$(echo $CREATE_RESPONSE | jq ".value" --raw-output)
+  NEW_RECORD_TTL=$(echo $CREATE_RESPONSE | jq ".ttl" --raw-output)
+
+  if [[ $NEW_RECORD_TYPE != "A" ]] || [[ $NEW_RECORD_HOSTNAME != $HOSTNAME ]] || [[ $NEW_RECORD_VALUE != $EXTERNAL_IP ]] || [[ $NEW_RECORD_TTL != $TTL ]]; then
+    logger_own ERROR "There was a problem creating the new entry, some values did not match"
+    exit
+  fi
+
+  logger_own INFO "Successfully updated $HOSTNAME to $EXTERNAL_IP with a TTL of $TTL"
+fi
+
