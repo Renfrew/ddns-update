@@ -2,9 +2,11 @@
 
 Scripts to update the DNS records
 
-Dependencies: `jq`, `dig`, `curl`
+The cloudflare script support both the IPv4 and the IPv6.
 
-**Notes**: IPv4 only
+The netlify script support only the IPv4 and is legacy, please use it with care.
+
+Dependencies: `jq`, `dig`, `curl`
 
 The script will log to `/var/log/me.renfrew.dnsUpdate.log` and `/var/log/me.renfrew.dnsUpdate.err`
 
@@ -18,4 +20,4 @@ The script will log to `/var/log/me.renfrew.dnsUpdate.log` and `/var/log/me.renf
 
 ## Sample cron job
 
-`*/15 * * * * /Users/renfrew/bin/dns-update sample-token example.me www 3600`
+`*/15 * * * * /Users/renfrew/bin/dns-update sample-towwwwwken example.me www 3600`
